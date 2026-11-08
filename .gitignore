@@ -8,3 +8,4 @@ runs/
 *.pt
 *.db
 .DS_Store
+outputs/
