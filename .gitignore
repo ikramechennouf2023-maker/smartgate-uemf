@@ -8,4 +8,5 @@ runs/
 *.pt
 *.db
 .DS_Store
-outputs/
+outputs/__pycache__/
+*.pyc
