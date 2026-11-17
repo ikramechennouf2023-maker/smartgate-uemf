@@ -10,3 +10,5 @@ runs/
 .DS_Store
 outputs/__pycache__/
 *.pyc
+__pycache__/
+*.pyc
