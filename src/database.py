@@ -5,7 +5,7 @@
 import sqlite3
 import secrets
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path("data/smartgate.db")
@@ -148,3 +148,20 @@ def enregistrer_passage(plaque, decision, confiance):
 def derniers_passages(n=20):
     with connexion() as conn:
         return conn.execute("SELECT * FROM journal ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+def derniere_plaque_inconnue(minutes=10):
+    with connexion() as conn:
+        ligne = conn.execute(
+            "SELECT plaque, date_heure FROM journal WHERE decision = 'VISITEUR' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if ligne:
+        quand = datetime.strptime(ligne["date_heure"], "%Y-%m-%d %H:%M:%S")
+        if datetime.now() - quand < timedelta(minutes=minutes):
+            return ligne["plaque"]
+    return ""
+
+
+def statut_visiteur(id_visiteur):
+    """'en_attente', 'accepte' ou 'refuse' (pour la page du visiteur)."""
+    with connexion() as conn:
+        ligne = conn.execute("SELECT statut FROM visiteurs WHERE id = ?", (id_visiteur,)).fetchone()
+    return ligne["statut"] if ligne else None
