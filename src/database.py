@@ -1,9 +1,12 @@
 """
-Étape D : la base de données SQLite de SmartGate UEMF.
-4 tables : vehicules, visiteurs, jetons, journal.
+La base de données SQLite de SmartGate UEMF.
+Tables : vehicules, visiteurs, jetons, journal, utilisateurs, corrections.
 """
-import sqlite3
+import hashlib
+import hmac
+import os
 import secrets
+import sqlite3
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -20,11 +23,11 @@ def connexion():
 
 
 def init_db():
-    """Crée les 4 tables si elles n'existent pas encore."""
+    """Crée les tables si elles n'existent pas, et ajoute les colonnes manquantes."""
     with connexion() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS vehicules (
-            plaque        TEXT PRIMARY KEY,      -- ex. 12345-L10-6 (unique)
+            plaque        TEXT PRIMARY KEY,      -- ex. 12345-أ-6 (unique)
             proprietaire  TEXT NOT NULL,
             role          TEXT NOT NULL,         -- étudiant / professeur / personnel
             valide_jusqu  TEXT NOT NULL,         -- date de fin d'autorisation (AAAA-MM-JJ)
@@ -48,10 +51,31 @@ def init_db():
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             date_heure  TEXT NOT NULL,
             plaque      TEXT,
-            decision    TEXT NOT NULL,           -- OUVRIR / VISITEUR / AGENT …
+            decision    TEXT NOT NULL,           -- OUVRIR / VISITEUR / AGENT / OUVERTURE_MANUELLE
             confiance   REAL
         );
+        CREATE TABLE IF NOT EXISTS utilisateurs (
+            identifiant   TEXT PRIMARY KEY,
+            mot_de_passe  TEXT NOT NULL,         -- l'EMPREINTE, jamais le mot de passe en clair
+            role          TEXT NOT NULL,         -- securite / admin
+            actif         INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS corrections (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            id_passage       INTEGER,
+            plaque_lue       TEXT,               -- ce que l'IA avait lu
+            plaque_corrigee  TEXT,               -- ce que l'agent a corrigé
+            photo            TEXT,               -- l'image (pour réentraîner l'IA plus tard)
+            agent            TEXT,
+            date_heure       TEXT
+        );
         """)
+
+        # Migration : ajouter au journal les colonnes qui n'existent pas encore
+        colonnes = {ligne["name"] for ligne in conn.execute("PRAGMA table_info(journal)")}
+        for col in ["raison", "proprietaire", "photo", "agent"]:
+            if col not in colonnes:
+                conn.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
 
 
 # ---------- VÉHICULES AUTORISÉS ----------
@@ -91,8 +115,15 @@ def changer_statut_visiteur(id_visiteur, statut):
         conn.execute("UPDATE visiteurs SET statut = ? WHERE id = ?", (statut, id_visiteur))
 
 
+def statut_visiteur(id_visiteur):
+    """'en_attente', 'accepte' ou 'refuse' (pour la page du visiteur)."""
+    with connexion() as conn:
+        ligne = conn.execute("SELECT statut FROM visiteurs WHERE id = ?", (id_visiteur,)).fetchone()
+    return ligne["statut"] if ligne else None
+
+
 def visiteur_accepte_aujourdhui(plaque):
-    """Le visiteur a-t-il été accepté aujourd'hui ? (pour rouvrir à la sortie, par exemple)"""
+    """Le visiteur a-t-il été accepté aujourd'hui ?"""
     with connexion() as conn:
         return conn.execute(
             "SELECT * FROM visiteurs WHERE plaque = ? AND date = ? AND statut = 'accepte'",
@@ -137,18 +168,30 @@ def utiliser_jeton(token):
 
 # ---------- JOURNAL DES PASSAGES ----------
 
-def enregistrer_passage(plaque, decision, confiance):
+def enregistrer_passage(plaque, decision, confiance, raison=None, proprietaire=None, photo=None, agent=None):
+    """Enregistre un passage et renvoie son numéro."""
     with connexion() as conn:
-        conn.execute(
-            "INSERT INTO journal (date_heure, plaque, decision, confiance) VALUES (?, ?, ?, ?)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plaque, decision, confiance),
+        cur = conn.execute(
+            "INSERT INTO journal (date_heure, plaque, decision, confiance, raison, proprietaire, photo, agent) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plaque, decision, confiance,
+             raison, proprietaire, photo, agent),
         )
+        return cur.lastrowid
 
 
 def derniers_passages(n=20):
     with connexion() as conn:
         return conn.execute("SELECT * FROM journal ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+
+
+def dernier_passage():
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM journal ORDER BY id DESC LIMIT 1").fetchone()
+
+
 def derniere_plaque_inconnue(minutes=10):
+    """La dernière plaque classée VISITEUR à la barrière (pour pré-remplir le formulaire)."""
     with connexion() as conn:
         ligne = conn.execute(
             "SELECT plaque, date_heure FROM journal WHERE decision = 'VISITEUR' ORDER BY id DESC LIMIT 1"
@@ -160,8 +203,46 @@ def derniere_plaque_inconnue(minutes=10):
     return ""
 
 
-def statut_visiteur(id_visiteur):
-    """'en_attente', 'accepte' ou 'refuse' (pour la page du visiteur)."""
+def corriger_plaque(id_passage, nouvelle_plaque, agent):
+    """L'agent corrige une plaque mal lue : on garde l'ancienne ET la nouvelle (pour l'IA)."""
     with connexion() as conn:
-        ligne = conn.execute("SELECT statut FROM visiteurs WHERE id = ?", (id_visiteur,)).fetchone()
-    return ligne["statut"] if ligne else None
+        p = conn.execute("SELECT * FROM journal WHERE id = ?", (id_passage,)).fetchone()
+        conn.execute(
+            "INSERT INTO corrections (id_passage, plaque_lue, plaque_corrigee, photo, agent, date_heure) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (id_passage, p["plaque"] if p else None, nouvelle_plaque, p["photo"] if p else None,
+             agent, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.execute("UPDATE journal SET plaque = ?, raison = ? WHERE id = ?",
+                     (nouvelle_plaque, f"plaque corrigée par {agent}", id_passage))
+
+
+# ---------- UTILISATEURS (connexion) ----------
+
+def _empreinte(mot_de_passe, sel=None):
+    """Calcule l'empreinte d'un mot de passe (PBKDF2, 200 000 tours). Le 'sel' rend chaque empreinte unique."""
+    sel = sel or os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", mot_de_passe.encode(), sel, 200_000)
+    return sel.hex() + "$" + h.hex()
+
+
+def creer_utilisateur(identifiant, mot_de_passe, role):
+    with connexion() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO utilisateurs (identifiant, mot_de_passe, role, actif) VALUES (?, ?, ?, 1)",
+            (identifiant, _empreinte(mot_de_passe), role),
+        )
+
+
+def verifier_connexion(identifiant, mot_de_passe):
+    """Renvoie le rôle ('securite' / 'admin') si c'est correct, sinon None."""
+    with connexion() as conn:
+        ligne = conn.execute(
+            "SELECT * FROM utilisateurs WHERE identifiant = ? AND actif = 1", (identifiant,)
+        ).fetchone()
+    if ligne is None:
+        return None
+    sel = bytes.fromhex(ligne["mot_de_passe"].split("$")[0])
+    if hmac.compare_digest(_empreinte(mot_de_passe, sel), ligne["mot_de_passe"]):
+        return ligne["role"]
+    return None
