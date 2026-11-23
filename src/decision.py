@@ -42,9 +42,20 @@ def decider(lecture):
 
 
 def traiter_entree(image):
-    """Toute la chaîne : photo → lecture → décision → journal."""
+    """Toute la chaîne : photo → lecture → décision → photo sauvegardée → journal."""
+    from datetime import datetime
+    from pathlib import Path
+    import cv2
     from ia import lire_plaque
+
     lecture = lire_plaque(image)
     resultat = decider(lecture)
-    enregistrer_passage(resultat["plaque"] or "?", resultat["decision"], resultat["confiance"])
+
+    dossier = Path("data/passages")                       # dans data/ → jamais sur GitHub 🔐
+    dossier.mkdir(parents=True, exist_ok=True)
+    photo = dossier / f"{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
+    cv2.imwrite(str(photo), image)
+
+    enregistrer_passage(resultat["plaque"] or "?", resultat["decision"], resultat["confiance"],
+                        raison=resultat["raison"], proprietaire=resultat["proprietaire"], photo=str(photo))
     return {**resultat, "box": lecture["box"]}
