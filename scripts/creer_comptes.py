@@ -1,7 +1,9 @@
-import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
 """
 Crée (ou réinitialise) les comptes de l'application.
-Usage : python src/creer_comptes.py
+Usage (depuis la racine du projet) : python scripts/creer_comptes.py
 """
 from getpass import getpass
 from database import init_db, creer_utilisateur
