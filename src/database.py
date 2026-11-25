@@ -1,6 +1,6 @@
 """
 La base de données SQLite de SmartGate UEMF.
-Tables : vehicules, visiteurs, jetons, journal, utilisateurs, corrections.
+Tables : vehicules, visiteurs, jetons, journal, utilisateurs, corrections, liste_noire.
 """
 import hashlib
 import hmac
@@ -20,6 +20,18 @@ def connexion():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _maintenant():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ajouter_colonnes(conn, table, colonnes):
+    """Migration : ajoute les colonnes manquantes à une table existante (sans rien effacer)."""
+    existantes = {ligne["name"] for ligne in conn.execute(f"PRAGMA table_info({table})")}
+    for nom, type_ in colonnes:
+        if nom not in existantes:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {nom} {type_}")
 
 
 def init_db():
@@ -44,14 +56,14 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS jetons (
             token     TEXT PRIMARY KEY,
-            cree_a    REAL NOT NULL,             -- heure de création (en secondes)
-            utilise   INTEGER DEFAULT 0          -- 0 = pas encore utilisé, 1 = utilisé
+            cree_a    REAL NOT NULL,
+            utilise   INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS journal (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             date_heure  TEXT NOT NULL,
             plaque      TEXT,
-            decision    TEXT NOT NULL,           -- OUVRIR / VISITEUR / AGENT / OUVERTURE_MANUELLE
+            decision    TEXT NOT NULL,           -- OUVRIR / VISITEUR / AGENT / REFUSE / OUVERTURE_MANUELLE
             confiance   REAL
         );
         CREATE TABLE IF NOT EXISTS utilisateurs (
@@ -63,19 +75,31 @@ def init_db():
         CREATE TABLE IF NOT EXISTS corrections (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             id_passage       INTEGER,
-            plaque_lue       TEXT,               -- ce que l'IA avait lu
-            plaque_corrigee  TEXT,               -- ce que l'agent a corrigé
-            photo            TEXT,               -- l'image (pour réentraîner l'IA plus tard)
+            plaque_lue       TEXT,
+            plaque_corrigee  TEXT,
+            photo            TEXT,
             agent            TEXT,
             date_heure       TEXT
         );
+        CREATE TABLE IF NOT EXISTS liste_noire (
+            plaque     TEXT PRIMARY KEY,
+            raison     TEXT,
+            ajoutee_le TEXT,
+            par        TEXT
+        );
         """)
+        _ajouter_colonnes(conn, "journal", [("raison", "TEXT"), ("proprietaire", "TEXT"),
+                                            ("photo", "TEXT"), ("agent", "TEXT")])
+        _ajouter_colonnes(conn, "visiteurs", [("pass_code", "TEXT"), ("pass_expire", "TEXT")])
 
-        # Migration : ajouter au journal les colonnes qui n'existent pas encore
-        colonnes = {ligne["name"] for ligne in conn.execute("PRAGMA table_info(journal)")}
-        for col in ["raison", "proprietaire", "photo", "agent"]:
-            if col not in colonnes:
-                conn.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
+
+def lire_table(nom, ordre="rowid DESC", limite=None):
+    """Lit toute une table (pour les tableaux et graphiques de l'administration)."""
+    if nom not in {"vehicules", "visiteurs", "journal", "corrections", "liste_noire"}:
+        raise ValueError(nom)
+    requete = f"SELECT * FROM {nom} ORDER BY {ordre}" + (f" LIMIT {int(limite)}" if limite else "")
+    with connexion() as conn:
+        return [dict(l) for l in conn.execute(requete).fetchall()]
 
 
 # ---------- VÉHICULES AUTORISÉS ----------
@@ -88,6 +112,11 @@ def ajouter_vehicule(plaque, proprietaire, role, valide_jusqu, handicap=False):
         )
 
 
+def supprimer_vehicule(plaque):
+    with connexion() as conn:
+        conn.execute("DELETE FROM vehicules WHERE plaque = ?", (plaque,))
+
+
 def trouver_vehicule(plaque):
     """Renvoie la ligne du véhicule s'il est autorisé AUJOURD'HUI, sinon None."""
     with connexion() as conn:
@@ -95,6 +124,24 @@ def trouver_vehicule(plaque):
             "SELECT * FROM vehicules WHERE plaque = ? AND valide_jusqu >= ?",
             (plaque, date.today().isoformat()),
         ).fetchone()
+
+
+# ---------- LISTE NOIRE ----------
+
+def ajouter_liste_noire(plaque, raison, par):
+    with connexion() as conn:
+        conn.execute("INSERT OR REPLACE INTO liste_noire VALUES (?, ?, ?, ?)",
+                     (plaque, raison, _maintenant(), par))
+
+
+def retirer_liste_noire(plaque):
+    with connexion() as conn:
+        conn.execute("DELETE FROM liste_noire WHERE plaque = ?", (plaque,))
+
+
+def est_liste_noire(plaque):
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM liste_noire WHERE plaque = ?", (plaque,)).fetchone()
 
 
 # ---------- VISITEURS ----------
@@ -110,24 +157,49 @@ def ajouter_visiteur(nom, plaque, batiment, motif):
 
 
 def changer_statut_visiteur(id_visiteur, statut):
-    """L'agent accepte ou refuse : statut = 'accepte' ou 'refuse'."""
     with connexion() as conn:
         conn.execute("UPDATE visiteurs SET statut = ? WHERE id = ?", (statut, id_visiteur))
 
 
-def statut_visiteur(id_visiteur):
-    """'en_attente', 'accepte' ou 'refuse' (pour la page du visiteur)."""
+def accepter_visiteur(id_visiteur, duree_heures=3):
+    """L'agent accepte : on crée un PASSE (code à 6 caractères) valable quelques heures."""
+    code = secrets.token_hex(3).upper()
+    expire = (datetime.now() + timedelta(hours=duree_heures)).strftime("%Y-%m-%d %H:%M:%S")
     with connexion() as conn:
-        ligne = conn.execute("SELECT statut FROM visiteurs WHERE id = ?", (id_visiteur,)).fetchone()
-    return ligne["statut"] if ligne else None
+        conn.execute("UPDATE visiteurs SET statut = 'accepte', pass_code = ?, pass_expire = ? WHERE id = ?",
+                     (code, expire, id_visiteur))
+    return code
+
+
+def trouver_visiteur(id_visiteur):
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM visiteurs WHERE id = ?", (id_visiteur,)).fetchone()
+
+
+def statut_visiteur(id_visiteur):
+    v = trouver_visiteur(id_visiteur)
+    return v["statut"] if v else None
+
+
+def verifier_passe(code):
+    """Pour l'agent, à la sortie : le passe est-il valable ? → (ok, message)"""
+    code = code.strip().upper().split(":")[-1]          # accepte "3FA9C1" ou "SMARTGATE-PASS:3FA9C1"
+    with connexion() as conn:
+        v = conn.execute("SELECT * FROM visiteurs WHERE pass_code = ?", (code,)).fetchone()
+    if v is None:
+        return False, "Passe inconnu"
+    if v["pass_expire"] and v["pass_expire"] < _maintenant():
+        return False, f"Passe expiré ({v['nom']}, depuis {v['pass_expire'][11:16]})"
+    return True, f"Passe valable : {v['nom']} · {v['plaque'] or '?'} · jusqu'à {v['pass_expire'][11:16]}"
 
 
 def visiteur_accepte_aujourdhui(plaque):
-    """Le visiteur a-t-il été accepté aujourd'hui ?"""
+    """Le visiteur a-t-il un passe encore valable aujourd'hui ?"""
     with connexion() as conn:
         return conn.execute(
-            "SELECT * FROM visiteurs WHERE plaque = ? AND date = ? AND statut = 'accepte'",
-            (plaque, date.today().isoformat()),
+            "SELECT * FROM visiteurs WHERE plaque = ? AND date = ? AND statut = 'accepte' "
+            "AND (pass_expire IS NULL OR pass_expire >= ?)",
+            (plaque, date.today().isoformat(), _maintenant()),
         ).fetchone()
 
 
@@ -142,7 +214,6 @@ DUREE_JETON = 120   # secondes : un QR est valable 2 minutes
 
 
 def creer_jeton():
-    """Crée un code aléatoire impossible à deviner, et l'enregistre."""
     token = secrets.token_urlsafe(8)
     with connexion() as conn:
         conn.execute("INSERT INTO jetons (token, cree_a) VALUES (?, ?)", (token, time.time()))
@@ -150,10 +221,7 @@ def creer_jeton():
 
 
 def utiliser_jeton(token):
-    """
-    Vérifie le jeton et le "consomme" (une seule utilisation).
-    Renvoie (True, "ok") ou (False, la raison du refus).
-    """
+    """Vérifie le jeton et le "consomme" (une seule utilisation). → (ok, message)"""
     with connexion() as conn:
         ligne = conn.execute("SELECT * FROM jetons WHERE token = ?", (token,)).fetchone()
         if ligne is None:
@@ -168,14 +236,14 @@ def utiliser_jeton(token):
 
 # ---------- JOURNAL DES PASSAGES ----------
 
-def enregistrer_passage(plaque, decision, confiance, raison=None, proprietaire=None, photo=None, agent=None):
+def enregistrer_passage(plaque, decision, confiance, raison=None, proprietaire=None, photo=None,
+                        agent=None, date_heure=None):
     """Enregistre un passage et renvoie son numéro."""
     with connexion() as conn:
         cur = conn.execute(
             "INSERT INTO journal (date_heure, plaque, decision, confiance, raison, proprietaire, photo, agent) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plaque, decision, confiance,
-             raison, proprietaire, photo, agent),
+            (date_heure or _maintenant(), plaque, decision, confiance, raison, proprietaire, photo, agent),
         )
         return cur.lastrowid
 
@@ -211,7 +279,7 @@ def corriger_plaque(id_passage, nouvelle_plaque, agent):
             "INSERT INTO corrections (id_passage, plaque_lue, plaque_corrigee, photo, agent, date_heure) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (id_passage, p["plaque"] if p else None, nouvelle_plaque, p["photo"] if p else None,
-             agent, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+             agent, _maintenant()),
         )
         conn.execute("UPDATE journal SET plaque = ?, raison = ? WHERE id = ?",
                      (nouvelle_plaque, f"plaque corrigée par {agent}", id_passage))
@@ -220,7 +288,7 @@ def corriger_plaque(id_passage, nouvelle_plaque, agent):
 # ---------- UTILISATEURS (connexion) ----------
 
 def _empreinte(mot_de_passe, sel=None):
-    """Calcule l'empreinte d'un mot de passe (PBKDF2, 200 000 tours). Le 'sel' rend chaque empreinte unique."""
+    """Empreinte d'un mot de passe (PBKDF2, 200 000 tours). Le 'sel' rend chaque empreinte unique."""
     sel = sel or os.urandom(16)
     h = hashlib.pbkdf2_hmac("sha256", mot_de_passe.encode(), sel, 200_000)
     return sel.hex() + "$" + h.hex()

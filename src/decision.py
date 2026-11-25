@@ -1,12 +1,14 @@
 """
-Étape E : la décision à la barrière, à partir de la lecture et de la base de données.
+La décision à la barrière, à partir de la lecture et de la base de données.
 """
 import config
-from database import trouver_vehicule, visiteur_accepte_aujourdhui, enregistrer_passage
+from database import (trouver_vehicule, visiteur_accepte_aujourdhui, enregistrer_passage,
+                      est_liste_noire)
 
 OUVRIR = "OUVRIR"        # ✅ barrière ouverte
 VISITEUR = "VISITEUR"    # ❓ inconnu → QR code dynamique à la sécurité
 AGENT = "AGENT"          # ⚠️ lecture pas sûre → l'agent vérifie
+REFUSE = "REFUSE"        # 🚫 plaque sur la liste noire
 
 
 def decider(lecture):
@@ -27,7 +29,12 @@ def decider(lecture):
     if conf < config.SEUIL_LECTURE:
         return {**resultat, "decision": AGENT, "raison": f"lecture incertaine ({conf:.2f})"}
 
-    # Filet ③ : la base de données
+    # Filet ③ : la liste noire
+    noire = est_liste_noire(plaque)
+    if noire:
+        return {**resultat, "decision": REFUSE, "raison": f"liste noire : {noire['raison'] or 'interdite'}"}
+
+    # Filet ④ : la base de données
     vehicule = trouver_vehicule(plaque)
     if vehicule:
         return {**resultat, "decision": OUVRIR,
@@ -36,7 +43,7 @@ def decider(lecture):
     visiteur = visiteur_accepte_aujourdhui(plaque)
     if visiteur:
         return {**resultat, "decision": OUVRIR,
-                "raison": "visiteur accepté aujourd'hui", "proprietaire": visiteur["nom"]}
+                "raison": "visiteur avec passe valable", "proprietaire": visiteur["nom"]}
 
     return {**resultat, "decision": VISITEUR, "raison": "plaque inconnue → QR code à la sécurité"}
 
@@ -51,7 +58,7 @@ def traiter_entree(image):
     lecture = lire_plaque(image)
     resultat = decider(lecture)
 
-    dossier = Path("data/passages")                       # dans data/ → jamais sur GitHub 🔐
+    dossier = Path("data/passages")                       # dans data/ → jamais sur GitHub
     dossier.mkdir(parents=True, exist_ok=True)
     photo = dossier / f"{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
     cv2.imwrite(str(photo), image)
