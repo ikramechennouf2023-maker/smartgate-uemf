@@ -6,14 +6,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import database
 
-database.init_db()
-# Sur le serveur en ligne : créer les comptes si la base est vide
-if not database.lire_table("utilisateurs") and "ADMIN_PASSWORD" in st.secrets:
-    database.creer_utilisateur("admin", st.secrets["ADMIN_PASSWORD"], "admin")
-    database.creer_utilisateur("agent1", st.secrets["AGENT_PASSWORD"], "securite")
 import streamlit as st
+import database
 from database import init_db
 from style import appliquer_style, carte_utilisateur
 
@@ -21,6 +16,16 @@ st.set_page_config(page_title="SmartGate UEMF", page_icon="🚧", layout="wide",
                    initial_sidebar_state="expanded")
 appliquer_style()
 init_db()
+
+# Sur le serveur en ligne : créer les comptes si la base est vide
+with database.connexion() as conn:
+    nb_comptes = conn.execute("SELECT COUNT(*) FROM utilisateurs").fetchone()[0]
+if nb_comptes == 0:
+    try:
+        database.creer_utilisateur("admin", st.secrets["ADMIN_PASSWORD"], "admin")
+        database.creer_utilisateur("agent1", st.secrets["AGENT_PASSWORD"], "securite")
+    except Exception:
+        pass   # pas de secrets (sur le Mac) : on utilise scripts/creer_comptes.py
 
 LOGO = Path(__file__).resolve().parent / "assets" / "logo_uemf.png"
 if LOGO.exists():
