@@ -6,7 +6,13 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import database
 
+database.init_db()
+# Sur le serveur en ligne : créer les comptes si la base est vide
+if not database.lire_table("utilisateurs") and "ADMIN_PASSWORD" in st.secrets:
+    database.creer_utilisateur("admin", st.secrets["ADMIN_PASSWORD"], "admin")
+    database.creer_utilisateur("agent1", st.secrets["AGENT_PASSWORD"], "securite")
 import streamlit as st
 from database import init_db
 from style import appliquer_style, carte_utilisateur
